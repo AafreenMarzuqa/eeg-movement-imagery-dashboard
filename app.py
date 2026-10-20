@@ -11,24 +11,11 @@ st.set_page_config(
     layout="wide"
 )
 
-DATA = (
-    "/content/drive/MyDrive/BCI_Project/results/"
-    "iv2b_causal_v2/iv2b_epochs_causal_v2.npz"
-)
-MODEL_PATH = (
-    "/content/drive/MyDrive/BCI_Project/"
-    "software_demo_model/eeg_left_right_models.joblib"
-)
-SUMMARY_PATH = (
-    "/content/drive/MyDrive/BCI_Project/results/"
-    "iv2b_causal_v2/adaptive_stability_v2/"
-    "step38_strict_policy_20261013/strict_policy_summary.csv"
-)
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA = os.path.join(APP_DIR, "iv2b_epochs_causal_v2.npz")
+MODEL_PATH = os.path.join(APP_DIR, "eeg_left_right_models.joblib")
+SUMMARY_PATH = os.path.join(APP_DIR, "strict_policy_summary.csv")
 
-LABELS = {0: "LEFT HAND IMAGINED", 1: "RIGHT HAND IMAGINED"}
-CHANNELS = ["C3", "Cz", "C4"]
-
-@st.cache_resource
 def load_model():
     return joblib.load(MODEL_PATH)
 
@@ -159,3 +146,4 @@ with tab_evaluate:
 
 st.divider()
 st.caption("Software-only demonstration • BCI Competition IV 2b recorded EEG")
+
