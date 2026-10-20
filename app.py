@@ -1,3 +1,4 @@
+
 import os
 import joblib
 import numpy as np
@@ -5,145 +6,361 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
+# --------------------------------------------------
+# Configuration
+# --------------------------------------------------
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DATA_PATH = os.path.join(
+    APP_DIR, "iv2b_epochs_causal_v2.npz"
+)
+MODEL_PATH = os.path.join(
+    APP_DIR, "eeg_left_right_models.joblib"
+)
+SUMMARY_PATH = os.path.join(
+    APP_DIR, "strict_policy_summary.csv"
+)
+
+LABELS = [
+    "LEFT HAND IMAGINED",
+    "RIGHT HAND IMAGINED"
+]
+
+SAMPLE_RATE = 250
+WINDOWS = [1.0, 1.5, 2.0, 2.5, 3.0]
+
 st.set_page_config(
-    page_title="EEG Movement Imagery",
+    page_title="EEG Movement Imagery Dashboard",
     page_icon="🧠",
     layout="wide"
 )
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA = os.path.join(APP_DIR, "iv2b_epochs_causal_v2.npz")
-MODEL_PATH = os.path.join(APP_DIR, "eeg_left_right_models.joblib")
-SUMMARY_PATH = os.path.join(APP_DIR, "strict_policy_summary.csv")
-
+# --------------------------------------------------
+# Load files
+# --------------------------------------------------
+@st.cache_resource
 def load_model():
     return joblib.load(MODEL_PATH)
 
-@st.cache_data
-def load_eeg():
-    with np.load(DATA) as d:
-        return d["X"].astype(np.float64), d["y"].astype(int)
 
 @st.cache_data
-def load_evaluation():
-    return pd.read_csv(SUMMARY_PATH)
+def load_dataset():
+    with np.load(DATA_PATH, allow_pickle=False) as d:
+        X = d["X"]
+        y = d["y"]
+        subjects = d["subjects"] if "subjects" in d.files else None
 
+    return X, y, subjects
+
+
+@st.cache_data
+def load_summary():
+    if os.path.exists(SUMMARY_PATH):
+        return pd.read_csv(SUMMARY_PATH)
+    return pd.DataFrame()
+
+
+# --------------------------------------------------
+# Model helper functions
+# --------------------------------------------------
+def get_window_model(artifact, window):
+    """Find the model saved for the selected observation window."""
+    if not isinstance(artifact, dict):
+        return artifact
+
+    # Support common dictionary layouts.
+    if "models" in artifact and isinstance(artifact["models"], dict):
+        artifact = artifact["models"]
+
+    candidates = [
+        window,
+        str(window),
+        f"{window:.1f}",
+        int(window) if float(window).is_integer() else None
+    ]
+
+    for key in candidates:
+        if key is not None and key in artifact:
+            return artifact[key]
+
+    # Also handle keys stored as strings such as "1.0s".
+    for key, model in artifact.items():
+        try:
+            if abs(float(str(key).lower().replace("s", "")) - window) < 1e-6:
+                return model
+        except (ValueError, TypeError):
+            continue
+
+    raise KeyError(
+        f"No model found for {window}-second window. "
+        f"Available model keys: {list(artifact.keys())}"
+    )
+
+
+def predict_trial(model, trial_data, window):
+    """Predict one trial using the selected window model."""
+    n_samples = int(round(window * SAMPLE_RATE))
+    segment = trial_data[:, :n_samples]
+
+    # Most saved CSP pipelines expect (trials, channels, samples).
+    input_data = segment[np.newaxis, :, :]
+
+    prediction = int(np.asarray(model.predict(input_data)).ravel()[0])
+
+    probabilities = None
+    if hasattr(model, "predict_proba"):
+        probabilities = np.asarray(
+            model.predict_proba(input_data)
+        )[0]
+
+    return prediction, probabilities, segment
+
+
+# --------------------------------------------------
+# Header
+# --------------------------------------------------
 st.title("🧠 EEG Movement Imagery Dashboard")
 st.caption("Recorded EEG classification using CSP + Logistic Regression")
-
-if not all(os.path.exists(p) for p in [DATA, MODEL_PATH, SUMMARY_PATH]):
-    st.error("Required files not found. Check that Google Drive is mounted in Colab.")
-    st.stop()
-
-artifact = load_model()
-X, y = load_eeg()
-evaluation = load_evaluation()
 
 st.info(
     "This application predicts recorded EEG trials. "
     "It does not capture live brain signals."
 )
 
-tab_predict, tab_evaluate = st.tabs(["EEG Prediction", "Research Evaluation"])
+# --------------------------------------------------
+# Check files and load resources
+# --------------------------------------------------
+required_files = [DATA_PATH, MODEL_PATH, SUMMARY_PATH]
+missing_files = [p for p in required_files if not os.path.isfile(p)]
 
-with tab_predict:
-    st.subheader("Predict imagined movement")
+if missing_files:
+    st.error("Required deployment files are missing:")
+    for path in missing_files:
+        st.write(f"- `{os.path.basename(path)}`")
+    st.stop()
 
-    col1, col2 = st.columns(2)
-    with col1:
-        trial = st.slider("Select EEG trial", 0, len(y) - 1, 0)
-    with col2:
-        seconds = st.selectbox(
+try:
+    X, y, subjects = load_dataset()
+    artifact = load_model()
+    summary = load_summary()
+except Exception as e:
+    st.error("Could not load the dataset, model, or research summary.")
+    st.exception(e)
+    st.stop()
+
+if X.ndim != 3:
+    st.error(f"Expected EEG data with 3 dimensions; received {X.shape}.")
+    st.stop()
+
+if len(X) != len(y):
+    st.error("Dataset error: number of EEG trials and labels do not match.")
+    st.stop()
+
+if X.shape[1] != 3:
+    st.warning(
+        f"Expected 3 EEG channels (C3, Cz, C4); found {X.shape[1]}."
+    )
+
+if X.shape[2] < SAMPLE_RATE:
+    st.error("Each EEG trial is shorter than one second.")
+    st.stop()
+
+# --------------------------------------------------
+# Tabs
+# --------------------------------------------------
+prediction_tab, evaluation_tab = st.tabs(
+    ["EEG Prediction", "Research Evaluation"]
+)
+
+# --------------------------------------------------
+# Prediction tab
+# --------------------------------------------------
+with prediction_tab:
+    st.header("Predict imagined movement")
+
+    col_trial, col_window = st.columns([1.2, 1])
+
+    with col_trial:
+        trial_index = st.slider(
+            "Select EEG trial",
+            min_value=0,
+            max_value=len(X) - 1,
+            value=min(579, len(X) - 1),
+            step=1
+        )
+
+    available_windows = [
+        w for w in WINDOWS
+        if int(round(w * SAMPLE_RATE)) <= X.shape[2]
+    ]
+
+    with col_window:
+        selected_window = st.selectbox(
             "Observation window (seconds)",
-            [1.0, 1.5, 2.0, 2.5, 3.0],
-            index=4
+            options=available_windows,
+            index=len(available_windows) - 1,
+            format_func=lambda w: f"{w:.1f}"
         )
 
     if st.button("Predict movement", type="primary"):
-        saved = artifact["models"][seconds]
-        eeg = X[trial:trial + 1, :, :saved["samples"]]
-        features = saved["csp"].transform(eeg)
-        clf = saved["classifier"]
+        try:
+            selected_model = get_window_model(
+                artifact, float(selected_window)
+            )
 
-        pred = int(clf.predict(features)[0])
-        raw = clf.predict_proba(features)[0]
-        probs = {
-            int(label): float(p)
-            for label, p in zip(clf.classes_, raw)
-        }
+            pred, probs, signal_segment = predict_trial(
+                selected_model,
+                X[trial_index],
+                float(selected_window)
+            )
 
-        st.markdown(f"## Prediction: {LABELS[pred]}")
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Model probability score", f"{probs[pred]:.1%}")
-        m2.metric("Left-hand probability", f"{probs[0]:.1%}")
-        m3.metric("Right-hand probability", f"{probs[1]:.1%}")
+            st.session_state["prediction_result"] = {
+                "trial": trial_index,
+                "window": float(selected_window),
+                "prediction": pred,
+                "probabilities": probs,
+                "signal": signal_segment
+            }
+        except Exception as e:
+            st.error("Prediction failed. Check the model and input dimensions.")
+            st.exception(e)
 
-        st.write("Recorded dataset label:", LABELS[int(y[trial])])
+    result = st.session_state.get("prediction_result")
 
-        prob_df = pd.DataFrame({
-            "Movement": ["Left hand", "Right hand"],
-            "Probability (%)": [probs[0] * 100, probs[1] * 100]
-        })
-        st.bar_chart(prob_df.set_index("Movement"))
+    if result is not None:
+        if (
+            result["trial"] != trial_index
+            or result["window"] != float(selected_window)
+        ):
+            st.caption("Click **Predict movement** to update the result.")
+        else:
+            pred = result["prediction"]
+            probs = result["probabilities"]
+            signal_segment = result["signal"]
 
-        times = np.arange(saved["samples"]) / artifact["sampling_rate"]
-        fig, axes = plt.subplots(3, 1, figsize=(11, 6), sharex=True)
-        for ch, name in enumerate(CHANNELS):
-            axes[ch].plot(times, X[trial, ch, :saved["samples"]])
-            axes[ch].set_ylabel(name)
-            axes[ch].grid(True, alpha=0.25)
-        axes[-1].set_xlabel("Time (seconds)")
-        fig.suptitle(f"Recorded EEG trial {trial}")
-        fig.tight_layout()
-        st.pyplot(fig)
-        plt.close(fig)
+            if pred not in (0, 1):
+                st.error(f"Unexpected model class: {pred}")
+            else:
+                st.markdown(f"## Prediction: {LABELS[pred]}")
 
-with tab_evaluate:
-    st.subheader("Nine-subject held-out research evaluation")
+                if probs is not None and len(probs) >= 2:
+                    classes = list(
+                        getattr(
+                            get_window_model(artifact, float(selected_window)),
+                            "classes_",
+                            [0, 1]
+                        )
+                    )
 
-    two = evaluation.loc[evaluation["rule"] == "two_window"].iloc[0]
-    three = evaluation.loc[evaluation["rule"] == "three_window"].iloc[0]
-    fixed_acc = float(evaluation["mean_fixed_accuracy_pct"].iloc[0])
-    fixed_bacc = float(evaluation["mean_fixed_balanced_accuracy_pct"].iloc[0])
+                    class_prob = {
+                        int(c): float(p)
+                        for c, p in zip(classes, probs)
+                    }
+                    left_prob = class_prob.get(0, 0.0)
+                    right_prob = class_prob.get(1, 0.0)
 
-    report = pd.DataFrame({
-        "Method": ["Fixed (3 seconds)", "Two-window adaptive", "Three-window adaptive"],
-        "Accuracy (%)": [
-            fixed_acc,
-            float(two["mean_adaptive_accuracy_pct"]),
-            float(three["mean_adaptive_accuracy_pct"])
-        ],
-        "Balanced accuracy (%)": [
-            fixed_bacc,
-            float(two["mean_adaptive_balanced_accuracy_pct"]),
-            float(three["mean_adaptive_balanced_accuracy_pct"])
-        ],
-        "Mean observation time (s)": [
-            3.0,
-            float(two["mean_window_s"]),
-            float(three["mean_window_s"])
-        ],
-        "Early stop (%)": [
-            0.0,
-            float(two["mean_early_stop_pct"]),
-            float(three["mean_early_stop_pct"])
-        ]
-    })
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Model probability score",
+                              f"{max(probs) * 100:.1f}%")
+                    c2.metric("Left-hand probability",
+                              f"{left_prob * 100:.1f}%")
+                    c3.metric("Right-hand probability",
+                              f"{right_prob * 100:.1f}%")
+                else:
+                    st.caption(
+                        "This model does not provide probability scores."
+                    )
 
-    st.dataframe(report.round(2), use_container_width=True, hide_index=True)
+                actual = int(y[trial_index])
+                st.write(
+                    "Recorded dataset label:",
+                    LABELS[actual] if actual in (0, 1) else str(actual)
+                )
 
-    st.markdown("### Accuracy comparison")
-    st.bar_chart(report.set_index("Method")[["Accuracy (%)"]])
+                if pred == actual:
+                    st.success("Prediction matches the recorded dataset label.")
+                else:
+                    st.warning(
+                        "Prediction differs from the recorded dataset label."
+                    )
 
-    st.markdown("### Mean observation time")
-    st.bar_chart(report.set_index("Method")[["Mean observation time (s)"]])
+                st.caption(
+                    "The displayed probability is the model's output, "
+                    "not an independently calibrated confidence estimate."
+                )
 
-    st.warning(
-        "Adaptive methods reduced observation time, but mean accuracy "
-        "was slightly lower than the fixed baseline in this evaluation. "
-        "These research results are separate from the all-data-trained demo model."
+            st.subheader(f"Recorded EEG trial {trial_index}")
+            times = np.arange(signal_segment.shape[1]) / SAMPLE_RATE
+            channel_names = ["C3", "Cz", "C4"]
+
+            fig, axes = plt.subplots(
+                signal_segment.shape[0], 1,
+                figsize=(12, 7), sharex=True
+            )
+            if signal_segment.shape[0] == 1:
+                axes = [axes]
+
+            for i, ax in enumerate(axes):
+                ax.plot(times, signal_segment[i], linewidth=1)
+                ax.set_ylabel(
+                    channel_names[i]
+                    if i < len(channel_names)
+                    else f"Channel {i + 1}"
+                )
+                ax.grid(True, alpha=0.25)
+
+            axes[-1].set_xlabel("Time (seconds)")
+            fig.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+
+            # Probability chart
+            if probs is not None and len(probs) >= 2:
+                st.subheader("Class probabilities")
+                chart_data = pd.DataFrame({
+                    "Imagined movement": [
+                        "Left hand", "Right hand"
+                    ],
+                    "Probability (%)": [
+                        left_prob * 100, right_prob * 100
+                    ]
+                }).set_index("Imagined movement")
+                st.bar_chart(chart_data)
+
+# --------------------------------------------------
+# Research evaluation tab
+# --------------------------------------------------
+with evaluation_tab:
+    st.header("Research Evaluation")
+
+    st.write(
+        "This table reports the saved research evaluation results. "
+        "These results are separate from the demo model trained on all "
+        "available trials."
     )
 
-st.divider()
-st.caption("Software-only demonstration • BCI Competition IV 2b recorded EEG")
+    if summary.empty:
+        st.warning("Research summary CSV is empty or unavailable.")
+    else:
+        st.dataframe(summary, use_container_width=True)
 
+        numeric_columns = summary.select_dtypes(
+            include=np.number
+        ).columns.tolist()
+
+        if numeric_columns:
+            st.subheader("Numeric research metrics")
+            st.bar_chart(summary[numeric_columns])
+
+    st.info(
+        "The research evaluation uses recorded EEG data and offline replay. "
+        "It is not a live EEG or real-time latency demonstration."
+    )
+
+# --------------------------------------------------
+# Footer
+# --------------------------------------------------
+st.divider()
+st.caption(
+    "Software-only demonstration • BCI Competition IV 2b recorded EEG"
+)
