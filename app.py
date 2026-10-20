@@ -6,26 +6,18 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-# --------------------------------------------------
-# Configuration
-# --------------------------------------------------
+# ============================================================
+# EEG Movement Imagery Dashboard
+# Software-only demo using recorded BCI Competition IV 2b EEG
+# ============================================================
+
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_PATH = os.path.join(APP_DIR, "iv2b_epochs_causal_v2.npz")
+MODEL_PATH = os.path.join(APP_DIR, "eeg_left_right_models.joblib")
+SUMMARY_PATH = os.path.join(APP_DIR, "strict_policy_summary.csv")
 
-DATA_PATH = os.path.join(
-    APP_DIR, "iv2b_epochs_causal_v2.npz"
-)
-MODEL_PATH = os.path.join(
-    APP_DIR, "eeg_left_right_models.joblib"
-)
-SUMMARY_PATH = os.path.join(
-    APP_DIR, "strict_policy_summary.csv"
-)
-
-LABELS = [
-    "LEFT HAND IMAGINED",
-    "RIGHT HAND IMAGINED"
-]
-
+LABELS = {0: "LEFT HAND IMAGINED", 1: "RIGHT HAND IMAGINED"}
+CHANNELS = ["C3", "Cz", "C4"]
 SAMPLE_RATE = 250
 WINDOWS = [1.0, 1.5, 2.0, 2.5, 3.0]
 
@@ -35,152 +27,273 @@ st.set_page_config(
     layout="wide"
 )
 
-# --------------------------------------------------
-# Load files
-# --------------------------------------------------
+
+# --------------------------- Loading ---------------------------
+
 @st.cache_resource
-def load_model():
+def load_artifact():
     return joblib.load(MODEL_PATH)
 
 
 @st.cache_data
 def load_dataset():
-    with np.load(DATA_PATH, allow_pickle=False) as d:
-        X = d["X"]
-        y = d["y"]
-        subjects = d["subjects"] if "subjects" in d.files else None
-
+    with np.load(DATA_PATH, allow_pickle=False) as data:
+        if "X" not in data.files or "y" not in data.files:
+            raise ValueError(
+                "The NPZ file must contain arrays named X and y."
+            )
+        X = data["X"]
+        y = data["y"]
+        subjects = data["subjects"] if "subjects" in data.files else None
     return X, y, subjects
 
 
 @st.cache_data
 def load_summary():
-    if os.path.exists(SUMMARY_PATH):
-        return pd.read_csv(SUMMARY_PATH)
-    return pd.DataFrame()
+    if not os.path.isfile(SUMMARY_PATH):
+        return pd.DataFrame()
+    return pd.read_csv(SUMMARY_PATH)
 
 
-# --------------------------------------------------
-# Model helper functions
-# --------------------------------------------------
-def get_window_model(artifact, window):
-    """Find the model saved for the selected observation window."""
+# ----------------------- Model discovery -----------------------
+
+def select_window_artifact(artifact, window):
+    """Select a model entry for the requested observation window."""
     if not isinstance(artifact, dict):
         return artifact
 
-    # Support common dictionary layouts.
-    if "models" in artifact and isinstance(artifact["models"], dict):
-        artifact = artifact["models"]
+    # Common nested format: {"models": {window: model, ...}}
+    if isinstance(artifact.get("models"), dict):
+        nested = artifact["models"]
+        selected = select_window_artifact(nested, window)
+        if selected is not None:
+            return selected
 
-    candidates = [
-        window,
-        str(window),
-        f"{window:.1f}",
-        int(window) if float(window).is_integer() else None
-    ]
-
-    for key in candidates:
-        if key is not None and key in artifact:
-            return artifact[key]
-
-    # Also handle keys stored as strings such as "1.0s".
-    for key, model in artifact.items():
+    # Common keys: 1.0, "1.0", "1.0s", "1.0_seconds"
+    for key, value in artifact.items():
         try:
-            if abs(float(str(key).lower().replace("s", "")) - window) < 1e-6:
-                return model
-        except (ValueError, TypeError):
+            key_text = str(key).lower().replace("_seconds", "").replace("seconds", "")
+            key_text = key_text.replace("sec", "").replace("s", "").strip()
+            if abs(float(key_text) - float(window)) < 1e-6:
+                return value
+        except (TypeError, ValueError):
             continue
 
-    raise KeyError(
-        f"No model found for {window}-second window. "
-        f"Available model keys: {list(artifact.keys())}"
+    # Sometimes models are stored as a list of entries.
+    return None
+
+
+def walk_objects(obj, depth=0, seen=None):
+    """Find nested sklearn estimators without looping forever."""
+    if seen is None:
+        seen = set()
+
+    if obj is None or depth > 8:
+        return
+
+    oid = id(obj)
+    if oid in seen:
+        return
+    seen.add(oid)
+
+    yield obj
+
+    if isinstance(obj, dict):
+        for value in obj.values():
+            yield from walk_objects(value, depth + 1, seen)
+        return
+
+    if isinstance(obj, (list, tuple)):
+        for value in obj:
+            yield from walk_objects(value, depth + 1, seen)
+        return
+
+    # sklearn Pipeline / estimator steps
+    steps = getattr(obj, "steps", None)
+    if steps:
+        for _, step in steps:
+            yield from walk_objects(step, depth + 1, seen)
+
+    # Common saved estimator attributes
+    for attr in ("csp", "clf", "classifier", "model", "estimator",
+                 "pipeline", "transformer", "feature_extractor"):
+        try:
+            child = getattr(obj, attr, None)
+        except Exception:
+            child = None
+        if child is not None and child is not obj:
+            yield from walk_objects(child, depth + 1, seen)
+
+
+def get_predictor(model_entry):
+    """Return a usable prediction estimator or raise a clear error."""
+    candidates = list(walk_objects(model_entry))
+
+    # Prefer a full pipeline that can predict directly.
+    for obj in candidates:
+        if callable(getattr(obj, "predict", None)):
+            if callable(getattr(obj, "transform", None)):
+                continue
+            return obj
+
+    raise ValueError(
+        "No object with a callable predict() method was found in the "
+        "selected saved model entry. The artifact's internal structure "
+        "needs to be inspected."
     )
 
 
-def predict_trial(model, trial_data, window):
-    """Predict one trial using the selected window model."""
-    n_samples = int(round(window * SAMPLE_RATE))
-    segment = trial_data[:, :n_samples]
+def get_transformer(model_entry, predictor):
+    """Find a separate CSP/feature transformer if one is saved."""
+    for obj in walk_objects(model_entry):
+        if obj is predictor:
+            continue
+        if callable(getattr(obj, "transform", None)):
+            return obj
+    return None
 
-    # Most saved CSP pipelines expect (trials, channels, samples).
+
+def predict_trial(artifact, trial_data, window):
+    """
+    Predict a recorded trial.
+
+    Supports:
+    - a saved sklearn Pipeline
+    - a dictionary containing a pipeline
+    - a dictionary containing separate transformer and classifier objects
+    """
+    model_entry = select_window_artifact(artifact, window)
+
+    if model_entry is None:
+        if callable(getattr(artifact, "predict", None)):
+            model_entry = artifact
+        else:
+            keys = list(artifact.keys()) if isinstance(artifact, dict) else []
+            raise ValueError(
+                f"No model entry found for {window:.1f} seconds. "
+                f"Available top-level keys: {keys}"
+            )
+
+    n_samples = int(round(float(window) * SAMPLE_RATE))
+    if trial_data.shape[-1] < n_samples:
+        raise ValueError(
+            f"Trial has {trial_data.shape[-1]} samples, but "
+            f"{n_samples} samples are needed for {window:.1f} seconds."
+        )
+
+    segment = np.asarray(trial_data[:, :n_samples], dtype=np.float64)
     input_data = segment[np.newaxis, :, :]
 
-    prediction = int(np.asarray(model.predict(input_data)).ravel()[0])
+    predictor = get_predictor(model_entry)
+    transformer = get_transformer(model_entry, predictor)
+
+    # A full pipeline handles features internally.
+    if callable(getattr(predictor, "predict", None)):
+        try:
+            raw_prediction = predictor.predict(input_data)
+            probabilities = (
+                np.asarray(predictor.predict_proba(input_data))[0]
+                if callable(getattr(predictor, "predict_proba", None))
+                else None
+            )
+            prediction = int(np.asarray(raw_prediction).ravel()[0])
+            return prediction, probabilities, segment
+        except Exception as direct_error:
+            # If the predictor expects extracted features, try a separate
+            # saved transformer. Otherwise provide the original error.
+            if transformer is None:
+                raise ValueError(
+                    "The saved predictor rejected EEG input with shape "
+                    f"{input_data.shape}. Original error: {direct_error}"
+                ) from direct_error
+
+    if transformer is None:
+        raise ValueError(
+            "The saved model has no usable feature transformer. "
+            "Expected a pipeline or a separate CSP transformer."
+        )
+
+    features = transformer.transform(input_data)
+    raw_prediction = predictor.predict(features)
+    prediction = int(np.asarray(raw_prediction).ravel()[0])
 
     probabilities = None
-    if hasattr(model, "predict_proba"):
+    if callable(getattr(predictor, "predict_proba", None)):
         probabilities = np.asarray(
-            model.predict_proba(input_data)
+            predictor.predict_proba(features)
         )[0]
 
     return prediction, probabilities, segment
 
 
-# --------------------------------------------------
-# Header
-# --------------------------------------------------
+# ----------------------------- UI -----------------------------
+
 st.title("🧠 EEG Movement Imagery Dashboard")
 st.caption("Recorded EEG classification using CSP + Logistic Regression")
-
 st.info(
     "This application predicts recorded EEG trials. "
     "It does not capture live brain signals."
 )
 
-# --------------------------------------------------
-# Check files and load resources
-# --------------------------------------------------
-required_files = [DATA_PATH, MODEL_PATH, SUMMARY_PATH]
-missing_files = [p for p in required_files if not os.path.isfile(p)]
+# Validate deployment files
+required = [DATA_PATH, MODEL_PATH, SUMMARY_PATH]
+missing = [os.path.basename(p) for p in required if not os.path.isfile(p)]
 
-if missing_files:
-    st.error("Required deployment files are missing:")
-    for path in missing_files:
-        st.write(f"- `{os.path.basename(path)}`")
+if missing:
+    st.error("Required files are missing from the deployed repository:")
+    for name in missing:
+        st.write(f"- `{name}`")
     st.stop()
 
 try:
     X, y, subjects = load_dataset()
-    artifact = load_model()
+    artifact = load_artifact()
     summary = load_summary()
-except Exception as e:
-    st.error("Could not load the dataset, model, or research summary.")
-    st.exception(e)
+except Exception as exc:
+    st.error("Unable to load the dataset, model, or summary.")
+    st.exception(exc)
     st.stop()
 
 if X.ndim != 3:
-    st.error(f"Expected EEG data with 3 dimensions; received {X.shape}.")
+    st.error(f"Expected X with shape (trials, channels, samples); got {X.shape}.")
     st.stop()
 
 if len(X) != len(y):
-    st.error("Dataset error: number of EEG trials and labels do not match.")
+    st.error("Dataset issue: X and y have different numbers of trials.")
+    st.stop()
+
+if len(X) == 0:
+    st.error("The dataset contains no trials.")
     st.stop()
 
 if X.shape[1] != 3:
-    st.warning(
-        f"Expected 3 EEG channels (C3, Cz, C4); found {X.shape[1]}."
-    )
+    st.warning(f"Expected 3 channels; dataset has {X.shape[1]}.")
 
 if X.shape[2] < SAMPLE_RATE:
-    st.error("Each EEG trial is shorter than one second.")
+    st.error("Trials are shorter than one second.")
     st.stop()
 
-# --------------------------------------------------
-# Tabs
-# --------------------------------------------------
-prediction_tab, evaluation_tab = st.tabs(
+available_windows = [
+    w for w in WINDOWS
+    if int(round(w * SAMPLE_RATE)) <= X.shape[2]
+]
+
+if not available_windows:
+    st.error("No supported observation window fits this dataset.")
+    st.stop()
+
+tab_prediction, tab_research = st.tabs(
     ["EEG Prediction", "Research Evaluation"]
 )
 
-# --------------------------------------------------
-# Prediction tab
-# --------------------------------------------------
-with prediction_tab:
+# ------------------------ Prediction tab ------------------------
+
+with tab_prediction:
     st.header("Predict imagined movement")
 
-    col_trial, col_window = st.columns([1.2, 1])
+    col1, col2 = st.columns([1.2, 1])
 
-    with col_trial:
+    with col1:
         trial_index = st.slider(
             "Select EEG trial",
             min_value=0,
@@ -189,124 +302,130 @@ with prediction_tab:
             step=1
         )
 
-    available_windows = [
-        w for w in WINDOWS
-        if int(round(w * SAMPLE_RATE)) <= X.shape[2]
-    ]
-
-    with col_window:
+    with col2:
         selected_window = st.selectbox(
             "Observation window (seconds)",
             options=available_windows,
             index=len(available_windows) - 1,
-            format_func=lambda w: f"{w:.1f}"
+            format_func=lambda value: f"{value:.1f}"
         )
 
     if st.button("Predict movement", type="primary"):
         try:
-            selected_model = get_window_model(
-                artifact, float(selected_window)
-            )
-
-            pred, probs, signal_segment = predict_trial(
-                selected_model,
+            prediction, probabilities, segment = predict_trial(
+                artifact,
                 X[trial_index],
                 float(selected_window)
             )
 
-            st.session_state["prediction_result"] = {
+            st.session_state["eeg_result"] = {
                 "trial": trial_index,
                 "window": float(selected_window),
-                "prediction": pred,
-                "probabilities": probs,
-                "signal": signal_segment
+                "prediction": prediction,
+                "probabilities": probabilities,
+                "segment": segment
             }
-        except Exception as e:
-            st.error("Prediction failed. Check the model and input dimensions.")
-            st.exception(e)
+        except Exception as exc:
+            st.error("Prediction could not be completed.")
+            st.exception(exc)
 
-    result = st.session_state.get("prediction_result")
+    result = st.session_state.get("eeg_result")
 
     if result is not None:
-        if (
-            result["trial"] != trial_index
-            or result["window"] != float(selected_window)
-        ):
-            st.caption("Click **Predict movement** to update the result.")
-        else:
-            pred = result["prediction"]
-            probs = result["probabilities"]
-            signal_segment = result["signal"]
+        same_selection = (
+            result["trial"] == trial_index
+            and result["window"] == float(selected_window)
+        )
 
-            if pred not in (0, 1):
-                st.error(f"Unexpected model class: {pred}")
+        if same_selection:
+            prediction = result["prediction"]
+            probabilities = result["probabilities"]
+            segment = result["segment"]
+
+            if prediction in LABELS:
+                st.markdown(f"## Prediction: {LABELS[prediction]}")
             else:
-                st.markdown(f"## Prediction: {LABELS[pred]}")
+                st.warning(f"Model returned unexpected class: {prediction}")
 
-                if probs is not None and len(probs) >= 2:
-                    classes = list(
-                        getattr(
-                            get_window_model(artifact, float(selected_window)),
-                            "classes_",
-                            [0, 1]
-                        )
-                    )
+            actual = int(y[trial_index])
+            actual_label = LABELS.get(actual, f"Class {actual}")
+            st.write("Recorded dataset label:", actual_label)
 
-                    class_prob = {
-                        int(c): float(p)
-                        for c, p in zip(classes, probs)
-                    }
-                    left_prob = class_prob.get(0, 0.0)
-                    right_prob = class_prob.get(1, 0.0)
+            if prediction == actual:
+                st.success("Prediction matches the recorded dataset label.")
+            else:
+                st.warning("Prediction differs from the recorded dataset label.")
 
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Model probability score",
-                              f"{max(probs) * 100:.1f}%")
-                    c2.metric("Left-hand probability",
-                              f"{left_prob * 100:.1f}%")
-                    c3.metric("Right-hand probability",
-                              f"{right_prob * 100:.1f}%")
-                else:
-                    st.caption(
-                        "This model does not provide probability scores."
-                    )
+            if probabilities is not None:
+                probabilities = np.asarray(probabilities).ravel()
 
-                actual = int(y[trial_index])
-                st.write(
-                    "Recorded dataset label:",
-                    LABELS[actual] if actual in (0, 1) else str(actual)
+                classes = getattr(
+                    get_predictor(
+                        select_window_artifact(artifact, float(selected_window))
+                        if select_window_artifact(artifact, float(selected_window)) is not None
+                        else artifact
+                    ),
+                    "classes_",
+                    np.arange(len(probabilities))
                 )
 
-                if pred == actual:
-                    st.success("Prediction matches the recorded dataset label.")
-                else:
-                    st.warning(
-                        "Prediction differs from the recorded dataset label."
-                    )
+                class_probs = {
+                    int(c): float(p)
+                    for c, p in zip(classes, probabilities)
+                }
+
+                left_probability = class_probs.get(0, 0.0)
+                right_probability = class_probs.get(1, 0.0)
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric(
+                    "Model probability score",
+                    f"{max(probabilities) * 100:.1f}%"
+                )
+                c2.metric(
+                    "Left-hand probability",
+                    f"{left_probability * 100:.1f}%"
+                )
+                c3.metric(
+                    "Right-hand probability",
+                    f"{right_probability * 100:.1f}%"
+                )
 
                 st.caption(
-                    "The displayed probability is the model's output, "
-                    "not an independently calibrated confidence estimate."
+                    "Probabilities are model outputs, not independently "
+                    "calibrated confidence estimates."
+                )
+
+                st.subheader("Class probabilities")
+                chart_df = pd.DataFrame({
+                    "Imagined movement": ["Left hand", "Right hand"],
+                    "Probability (%)": [
+                        left_probability * 100,
+                        right_probability * 100
+                    ]
+                }).set_index("Imagined movement")
+                st.bar_chart(chart_df)
+            else:
+                st.caption(
+                    "The saved predictor does not provide predict_proba()."
                 )
 
             st.subheader(f"Recorded EEG trial {trial_index}")
-            times = np.arange(signal_segment.shape[1]) / SAMPLE_RATE
-            channel_names = ["C3", "Cz", "C4"]
+            times = np.arange(segment.shape[1]) / SAMPLE_RATE
 
             fig, axes = plt.subplots(
-                signal_segment.shape[0], 1,
-                figsize=(12, 7), sharex=True
+                segment.shape[0], 1,
+                figsize=(12, 7),
+                sharex=True
             )
-            if signal_segment.shape[0] == 1:
+
+            if segment.shape[0] == 1:
                 axes = [axes]
 
-            for i, ax in enumerate(axes):
-                ax.plot(times, signal_segment[i], linewidth=1)
-                ax.set_ylabel(
-                    channel_names[i]
-                    if i < len(channel_names)
-                    else f"Channel {i + 1}"
-                )
+            for index, ax in enumerate(axes):
+                ax.plot(times, segment[index], linewidth=1)
+                channel = CHANNELS[index] if index < len(CHANNELS) else f"Channel {index + 1}"
+                ax.set_ylabel(channel)
                 ax.grid(True, alpha=0.25)
 
             axes[-1].set_xlabel("Time (seconds)")
@@ -314,52 +433,35 @@ with prediction_tab:
             st.pyplot(fig)
             plt.close(fig)
 
-            # Probability chart
-            if probs is not None and len(probs) >= 2:
-                st.subheader("Class probabilities")
-                chart_data = pd.DataFrame({
-                    "Imagined movement": [
-                        "Left hand", "Right hand"
-                    ],
-                    "Probability (%)": [
-                        left_prob * 100, right_prob * 100
-                    ]
-                }).set_index("Imagined movement")
-                st.bar_chart(chart_data)
+        else:
+            st.caption("Click **Predict movement** to update the result.")
 
-# --------------------------------------------------
-# Research evaluation tab
-# --------------------------------------------------
-with evaluation_tab:
+# ----------------------- Research tab -----------------------
+
+with tab_research:
     st.header("Research Evaluation")
 
     st.write(
-        "This table reports the saved research evaluation results. "
-        "These results are separate from the demo model trained on all "
-        "available trials."
+        "The following table displays the saved offline research results. "
+        "These results are separate from the demo model's prediction for "
+        "an individual trial."
     )
 
     if summary.empty:
-        st.warning("Research summary CSV is empty or unavailable.")
+        st.warning("The research summary CSV is empty.")
     else:
         st.dataframe(summary, use_container_width=True)
 
-        numeric_columns = summary.select_dtypes(
-            include=np.number
-        ).columns.tolist()
-
-        if numeric_columns:
+        numeric = summary.select_dtypes(include=np.number)
+        if not numeric.empty:
             st.subheader("Numeric research metrics")
-            st.bar_chart(summary[numeric_columns])
+            st.bar_chart(numeric)
 
     st.info(
-        "The research evaluation uses recorded EEG data and offline replay. "
-        "It is not a live EEG or real-time latency demonstration."
+        "This is an offline replay on recorded EEG trials, not a live EEG "
+        "or real-time latency demonstration."
     )
 
-# --------------------------------------------------
-# Footer
-# --------------------------------------------------
 st.divider()
 st.caption(
     "Software-only demonstration • BCI Competition IV 2b recorded EEG"
