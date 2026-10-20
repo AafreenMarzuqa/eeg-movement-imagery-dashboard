@@ -1,0 +1,3 @@
+rule,subjects,mean_fixed_accuracy_pct,mean_adaptive_accuracy_pct,mean_accuracy_difference_pp,mean_fixed_balanced_accuracy_pct,mean_adaptive_balanced_accuracy_pct,mean_balanced_accuracy_difference_pp,mean_window_s,mean_early_stop_pct,constraint_feasible_folds
+two_window,9,64.20723753971743,63.53361844894002,-0.6736190907774011,64.55207831991746,63.8725701154478,-0.6795082044696514,2.1053382336230597,69.02365192921305,9
+three_window,9,64.20723753971743,63.383184678324355,-0.824052861393074,64.55207831991746,63.71950755724831,-0.8325707626691418,2.3473691351072907,72.28485121631223,9
